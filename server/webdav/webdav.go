@@ -543,15 +543,15 @@ func (h *Handler) handlePut(w http.ResponseWriter, r *http.Request) (status int,
 		}
 		return http.StatusInternalServerError, err
 	}
-	fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
-	if err != nil {
-		return http.StatusInternalServerError, err
+	// The upload has gone through even if the storage does not list the new
+	// file yet. Reporting a failure here only makes the client upload it again.
+	if fi, err = fs.Get(ctx, reqPath, &fs.GetArgs{}); err == nil {
+		etag, err := findETag(ctx, h.LockSystem, reqPath, fi)
+		if err != nil {
+			return http.StatusInternalServerError, err
+		}
+		w.Header().Set("Etag", etag)
 	}
-	etag, err := findETag(ctx, h.LockSystem, reqPath, fi)
-	if err != nil {
-		return http.StatusInternalServerError, err
-	}
-	w.Header().Set("Etag", etag)
 	if exists {
 		w.WriteHeader(http.StatusNoContent)
 	} else {
