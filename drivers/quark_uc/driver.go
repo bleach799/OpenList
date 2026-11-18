@@ -23,6 +23,7 @@ type QuarkOrUC struct {
 	Addition
 	config driver.Config
 	conf   Conf
+	recent recentChanges
 }
 
 func (d *QuarkOrUC) Config() driver.Config {
@@ -57,7 +58,7 @@ func (d *QuarkOrUC) List(ctx context.Context, dir model.Obj, args model.ListArgs
 		return nil, err
 	}
 
-	return files, nil
+	return d.recent.apply(dir.GetID(), files, d.listable), nil
 }
 
 func (d *QuarkOrUC) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
@@ -70,7 +71,7 @@ func (d *QuarkOrUC) Link(ctx context.Context, file model.Obj, args model.LinkArg
 	return d.getDownloadLink(file)
 }
 
-func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
 	data := base.Json{
 		"dir_init_lock": false,
 		"dir_path":      "",
@@ -80,16 +81,23 @@ func (d *QuarkOrUC) MakeDir(ctx context.Context, parentDir model.Obj, dirName st
 	_, err := d.request("/file", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
-	if err == nil || err.Error() == "file is doloading[同名冲突]" {
-		time.Sleep(time.Second)
+	conflict := err != nil && err.Error() == "file is doloading[同名冲突]"
+	if err != nil && !conflict {
+		return nil, err
 	}
-	if err != nil && err.Error() == "file is doloading[同名冲突]" {
-		return errs.ObjectAlreadyExists
+	// Return the listed directory so op.MakeDir caches it instead of a temp
+	// entry, which would make the next lookup list the parent again too early.
+	if dir := d.waitForDir(ctx, parentDir.GetID(), dirName); dir != nil {
+		d.recent.put(parentDir.GetID(), dir)
+		return dir, nil
 	}
-	return err
+	if conflict {
+		return nil, errs.ObjectAlreadyExists
+	}
+	return nil, nil
 }
 
-func (d *QuarkOrUC) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
+func (d *QuarkOrUC) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
 	data := base.Json{
 		"action_type":  1,
 		"exclude_fids": []string{},
@@ -99,10 +107,20 @@ func (d *QuarkOrUC) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
 	_, err := d.request("/file/move", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	// the fid stays the same when moving
+	f, ok := srcObj.(*File)
+	if !ok {
+		return nil, nil
+	}
+	moved := *f
+	d.recent.put(dstDir.GetID(), &moved)
+	return &moved, nil
 }
 
-func (d *QuarkOrUC) Rename(ctx context.Context, srcObj model.Obj, newName string) error {
+func (d *QuarkOrUC) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
 	data := base.Json{
 		"fid":       srcObj.GetID(),
 		"file_name": newName,
@@ -110,7 +128,18 @@ func (d *QuarkOrUC) Rename(ctx context.Context, srcObj model.Obj, newName string
 	_, err := d.request("/file/rename", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	// the fid stays the same when renaming
+	f, ok := srcObj.(*File)
+	if !ok {
+		return nil, nil
+	}
+	renamed := *f
+	renamed.FileName = newName
+	d.recent.rename(&renamed)
+	return &renamed, nil
 }
 
 func (d *QuarkOrUC) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
@@ -126,10 +155,13 @@ func (d *QuarkOrUC) Remove(ctx context.Context, obj model.Obj) error {
 	_, err := d.request("/file/delete", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
+	if err == nil {
+		d.recent.remove(obj.GetID())
+	}
 	return err
 }
 
-func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	md5Str, sha1Str := stream.GetHash().GetHash(utils.MD5), stream.GetHash().GetHash(utils.SHA1)
 	var (
 		md5  hash.Hash
@@ -148,7 +180,7 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 	if len(writers) > 0 {
 		_, err := stream.CacheFullAndWriter(&up, io.MultiWriter(writers...))
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if md5 != nil {
 			md5Str = hex.EncodeToString(md5.Sum(nil))
@@ -160,21 +192,21 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 	// pre
 	pre, err := d.upPre(stream, dstDir.GetID())
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// hash
 	finish, err := d.upHash(md5Str, sha1Str, pre.Data.TaskId)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if finish {
 		up(100)
-		return nil
+		return d.uploaded(dstDir, stream, pre), nil
 	}
 	// part up
 	ss, err := streamPkg.NewStreamSectionReader(stream, pre.Metadata.PartSize, &up)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	total := stream.GetSize()
 	partSize := int64(pre.Metadata.PartSize)
@@ -182,13 +214,13 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 	md5s := make([]string, 0, uploadNums)
 	for partIndex := range uploadNums {
 		if utils.IsCanceled(ctx) {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 		offset := int64(partIndex) * partSize
 		size := min(partSize, total-offset)
 		rd, err := ss.GetSectionReader(offset, size)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		err = retry.Do(func() error {
 			rd.Seek(0, io.SeekStart)
@@ -209,17 +241,20 @@ func (d *QuarkOrUC) Put(ctx context.Context, dstDir model.Obj, stream model.File
 			retry.Delay(time.Second))
 		ss.FreeSectionReader(rd)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		up(95 * float64(offset+size) / float64(total))
 	}
 	up(97)
 	err = d.upCommit(pre, md5s)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer up(100)
-	return d.upFinish(pre)
+	if err = d.upFinish(pre); err != nil {
+		return nil, err
+	}
+	return d.uploaded(dstDir, stream, pre), nil
 }
 
 func (d *QuarkOrUC) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
